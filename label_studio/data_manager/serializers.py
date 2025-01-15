@@ -4,11 +4,19 @@ import os
 
 import ujson as json
 from data_manager.models import Filter, FilterGroup, View
+from django.conf import settings
 from django.db import transaction
+from drf_yasg import openapi
 from projects.models import Project
 from rest_framework import serializers
 from tasks.models import Task
-from tasks.serializers import AnnotationDraftSerializer, AnnotationSerializer, PredictionSerializer, TaskSerializer
+from tasks.serializers import (
+    AnnotationDraftSerializer,
+    AnnotationSerializer,
+    PredictionSerializer,
+    TaskSerializer,
+)
+from users.models import User
 
 from label_studio.core.utils.common import round_floats
 
@@ -17,6 +25,49 @@ class FilterSerializer(serializers.ModelSerializer):
     class Meta:
         model = Filter
         fields = '__all__'
+
+    def validate_column(self, column: str) -> str:
+        """
+        Ensure that the passed filter expression starts with 'filter:tasks:' and contains
+        no foreign key traversals. This means either the filter expression contains no '__'
+        substrings, or that it's the task.data json field that's accessed.
+
+        Users depending on foreign key traversals in views can allowlist them via the
+        DATA_MANAGER_FILTER_ALLOWLIST setting in the env.
+
+        Edit with care. The validations below are critical for security.
+        """
+
+        column_copy = column
+
+        # We may support 'filter:annotations:' in the future, but we don't as of yet.
+        required_prefix = 'filter:tasks:'
+        optional_prefix = '-'
+
+        if not column_copy.startswith(required_prefix):
+            raise serializers.ValidationError(f'Filter "{column}" should start with "{required_prefix}"')
+
+        column_copy = column_copy[len(required_prefix) :]
+
+        if column_copy.startswith(optional_prefix):
+            column_copy = column_copy[len(optional_prefix) :]
+
+        if column_copy.startswith('data.'):
+            # Allow underscores if the filter is based on the `task.data` JSONField, because these don't leverage foreign keys.
+            return column
+
+        # Specific filters relying on foreign keys can be allowlisted
+        if column_copy in settings.DATA_MANAGER_FILTER_ALLOWLIST:
+            return column
+
+        # But in general, we don't allow foreign keys
+        if '__' in column_copy:
+            raise serializers.ValidationError(
+                f'"__" is not generally allowed in filters. Consider asking your administrator to add "{column_copy}" '
+                'to DATA_MANAGER_FILTER_ALLOWLIST, but note that some filter expressions may pose a security risk'
+            )
+
+        return column
 
 
 class FilterGroupSerializer(serializers.ModelSerializer):
@@ -158,11 +209,137 @@ class ViewSerializer(serializers.ModelSerializer):
             return instance
 
 
+class UpdatedByDMFieldSerializer(serializers.SerializerMethodField):
+    # TODO: get_updated_by implementation is weird, but we need to adhere schema to it
+    class Meta:
+        swagger_schema_fields = {
+            'type': openapi.TYPE_ARRAY,
+            'title': 'User IDs',
+            'description': 'User IDs who updated this task',
+            'items': {'type': openapi.TYPE_OBJECT, 'title': 'User IDs'},
+        }
+
+
+class AnnotatorsDMFieldSerializer(serializers.SerializerMethodField):
+    # TODO: get_updated_by implementation is weird, but we need to adhere schema to it
+    class Meta:
+        swagger_schema_fields = {
+            'type': openapi.TYPE_ARRAY,
+            'title': 'Annotators IDs',
+            'description': 'Annotators IDs who annotated this task',
+            'items': {'type': openapi.TYPE_INTEGER, 'title': 'User IDs'},
+        }
+
+
+class CompletedByDMSerializerWithGenericSchema(serializers.PrimaryKeyRelatedField):
+    # TODO: likely we need to remove full user details from GET /api/tasks/{id} as it non-secure and currently controlled by the export toggle
+    class Meta:
+        swagger_schema_fields = {
+            'type': openapi.TYPE_OBJECT,
+            'title': 'User details',
+            'description': 'User details who completed this annotation.',
+        }
+
+
+class AnnotationsDMFieldSerializer(AnnotationSerializer):
+    completed_by = CompletedByDMSerializerWithGenericSchema(required=False, queryset=User.objects.all())
+
+
+class AnnotationDraftDMFieldSerializer(serializers.SerializerMethodField):
+    class Meta:
+        swagger_schema_fields = {
+            'type': openapi.TYPE_ARRAY,
+            'title': 'Annotation drafts',
+            'description': 'Drafts for this task',
+            'items': {
+                'type': openapi.TYPE_OBJECT,
+                'title': 'Draft object',
+                'properties': {
+                    'result': {
+                        'type': openapi.TYPE_ARRAY,
+                        'title': 'Draft result',
+                        'items': {
+                            'type': openapi.TYPE_OBJECT,
+                            'title': 'Draft result item',
+                        },
+                    },
+                    'created_at': {
+                        'type': openapi.TYPE_STRING,
+                        'format': 'date-time',
+                        'title': 'Creation time',
+                    },
+                    'updated_at': {
+                        'type': openapi.TYPE_STRING,
+                        'format': 'date-time',
+                        'title': 'Last update time',
+                    },
+                },
+            },
+        }
+
+
+class PredictionsDMFieldSerializer(serializers.SerializerMethodField):
+    class Meta:
+        swagger_schema_fields = {
+            'type': openapi.TYPE_ARRAY,
+            'title': 'Predictions',
+            'description': 'Predictions for this task',
+            'items': {
+                'type': openapi.TYPE_OBJECT,
+                'title': 'Prediction object',
+                'properties': {
+                    'result': {
+                        'type': openapi.TYPE_ARRAY,
+                        'title': 'Prediction result',
+                        'items': {
+                            'type': openapi.TYPE_OBJECT,
+                            'title': 'Prediction result item',
+                        },
+                    },
+                    'score': {
+                        'type': openapi.TYPE_NUMBER,
+                        'title': 'Prediction score',
+                    },
+                    'model_version': {
+                        'type': openapi.TYPE_STRING,
+                        'title': 'Model version',
+                    },
+                    'model': {
+                        'type': openapi.TYPE_OBJECT,
+                        'title': 'ML Backend instance',
+                    },
+                    'model_run': {
+                        'type': openapi.TYPE_OBJECT,
+                        'title': 'Model Run instance',
+                    },
+                    'task': {
+                        'type': openapi.TYPE_INTEGER,
+                        'title': 'Task ID related to the prediction',
+                    },
+                    'project': {
+                        'type': openapi.TYPE_NUMBER,
+                        'title': 'Project ID related to the prediction',
+                    },
+                    'created_at': {
+                        'type': openapi.TYPE_STRING,
+                        'format': 'date-time',
+                        'title': 'Creation time',
+                    },
+                    'updated_at': {
+                        'type': openapi.TYPE_STRING,
+                        'format': 'date-time',
+                        'title': 'Last update time',
+                    },
+                },
+            },
+        }
+
+
 class DataManagerTaskSerializer(TaskSerializer):
-    predictions = serializers.SerializerMethodField(required=False, read_only=True)
-    annotations = AnnotationSerializer(required=False, many=True, default=[], read_only=True)
-    drafts = serializers.SerializerMethodField(required=False, read_only=True)
-    annotators = serializers.SerializerMethodField(required=False, read_only=True)
+    predictions = PredictionsDMFieldSerializer(required=False, read_only=True)
+    annotations = AnnotationsDMFieldSerializer(required=False, many=True, default=[], read_only=True)
+    drafts = AnnotationDraftDMFieldSerializer(required=False, read_only=True)
+    annotators = AnnotatorsDMFieldSerializer(required=False, read_only=True)
 
     inner_id = serializers.IntegerField(required=False)
     cancelled_annotations = serializers.IntegerField(required=False)
@@ -178,7 +355,7 @@ class DataManagerTaskSerializer(TaskSerializer):
     predictions_model_versions = serializers.SerializerMethodField(required=False)
     avg_lead_time = serializers.FloatField(required=False)
     draft_exists = serializers.BooleanField(required=False)
-    updated_by = serializers.SerializerMethodField(required=False, read_only=True)
+    updated_by = UpdatedByDMFieldSerializer(required=False, read_only=True)
 
     CHAR_LIMITS = 500
 
@@ -237,7 +414,7 @@ class DataManagerTaskSerializer(TaskSerializer):
 
     @staticmethod
     def get_storage_filename(task):
-        return task.storage_filename
+        return task.get_storage_filename()
 
     @staticmethod
     def get_updated_by(obj):
@@ -309,3 +486,10 @@ class SelectedItemsSerializer(serializers.Serializer):
 
 class ViewResetSerializer(serializers.Serializer):
     project = serializers.PrimaryKeyRelatedField(queryset=Project.objects.all())
+
+
+class ViewOrderSerializer(serializers.Serializer):
+    project = serializers.IntegerField()
+    ids = serializers.ListField(
+        child=serializers.IntegerField(), allow_empty=False, help_text='A list of view IDs in the desired order.'
+    )

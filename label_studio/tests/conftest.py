@@ -145,7 +145,9 @@ def s3_with_hypertext_s3_links(s3):
     s3.put_object(
         Bucket=bucket_name,
         Key='test.json',
-        Body=json.dumps({'text': '<a href="s3://hypertext-bucket/file with /spaces and\' / \' / quotes.jpg"/>'}),
+        Body=json.dumps(
+            {'text': '<a href="s3://pytest-s3-jsons-hypertext/file with /spaces and\' / \' / quotes.jpg"/>'}
+        ),
     )
     yield s3
 
@@ -157,7 +159,11 @@ def s3_with_partially_encoded_s3_links(s3):
     s3.put_object(
         Bucket=bucket_name,
         Key='test.json',
-        Body=json.dumps({'text': '<a href="s3://hypertext-bucket/file with /spaces and\' / \' / %2Bquotes%3D.jpg"/>'}),
+        Body=json.dumps(
+            {
+                'text': '<a href="s3://pytest-s3-json-partially-encoded/file with /spaces and\' / \' / %2Bquotes%3D.jpg"/>'
+            }
+        ),
     )
     yield s3
 
@@ -253,17 +259,25 @@ def s3_export_bucket_kms(s3):
     yield s3
 
 
-def mock_put_aes(*args, **kwargs):
-    if 'ServerSideEncryption' not in kwargs or kwargs['ServerSideEncryption'] != 'AES256':
-        raise ClientError(
-            error_response={'Error': {'Code': 'AccessDenied', 'Message': 'Access Denied'}}, operation_name='PutObject'
-        )
+def mock_put(*args, **kwargs):
+    client_error = ClientError(
+        error_response={'Error': {'Code': 'AccessDenied', 'Message': 'Access Denied'}}, operation_name='PutObject'
+    )
+    if kwargs['ServerSideEncryption'] == 'AES256':
+        if 'ServerSideEncryption' not in kwargs:
+            raise client_error
+    elif kwargs['ServerSideEncryption'] == 'aws:kms':
+        if 'ServerSideEncryption' not in kwargs or 'SSEKMSKeyId' not in kwargs:
+            raise client_error
+
+    else:
+        raise client_error
 
 
 @pytest.fixture()
 def mock_s3_resource_aes(mocker):
     mock_object = MagicMock()
-    mock_object.put = mock_put_aes
+    mock_object.put = mock_put
 
     mock_object_constructor = MagicMock()
     mock_object_constructor.return_value = mock_object
@@ -275,21 +289,10 @@ def mock_s3_resource_aes(mocker):
     mocker.patch('boto3.Session.resource', return_value=mock_s3_resource)
 
 
-def mock_put_kms(*args, **kwargs):
-    if (
-        'ServerSideEncryption' not in kwargs
-        or kwargs['ServerSideEncryption'] != 'aws:kms'
-        or 'SSEKMSKeyId' not in kwargs
-    ):
-        raise ClientError(
-            error_response={'Error': {'Code': 'AccessDenied', 'Message': 'Access Denied'}}, operation_name='PutObject'
-        )
-
-
 @pytest.fixture()
 def mock_s3_resource_kms(mocker):
     mock_object = MagicMock()
-    mock_object.put = mock_put_kms
+    mock_object.put = mock_put
 
     mock_object_constructor = MagicMock()
     mock_object_constructor.return_value = mock_object
@@ -317,6 +320,62 @@ def azure_client():
 def redis_client():
     with redis_client_mock():
         yield
+
+
+@pytest.fixture
+def ml_backend_for_test_predict(ml_backend):
+    # ML backend with single prediction per task
+    register_ml_backend_mock(
+        ml_backend,
+        url='http://test.ml.backend.for.sdk.com:9092',
+        predictions={
+            'results': [
+                {
+                    'model_version': 'ModelSingle',
+                    'score': 0.1,
+                    'result': [
+                        {'from_name': 'label', 'to_name': 'text', 'type': 'choices', 'value': {'choices': ['Single']}}
+                    ],
+                },
+            ]
+        },
+    )
+    # ML backend with multiple predictions per task
+    register_ml_backend_mock(
+        ml_backend,
+        url='http://test.ml.backend.for.sdk.com:9093',
+        predictions={
+            'results': [
+                [
+                    {
+                        'model_version': 'ModelA',
+                        'score': 0.2,
+                        'result': [
+                            {
+                                'from_name': 'label',
+                                'to_name': 'text',
+                                'type': 'choices',
+                                'value': {'choices': ['label_A']},
+                            }
+                        ],
+                    },
+                    {
+                        'model_version': 'ModelB',
+                        'score': 0.3,
+                        'result': [
+                            {
+                                'from_name': 'label',
+                                'to_name': 'text',
+                                'type': 'choices',
+                                'value': {'choices': ['label_B']},
+                            }
+                        ],
+                    },
+                ]
+            ]
+        },
+    )
+    yield ml_backend
 
 
 @pytest.fixture(autouse=True)
@@ -375,7 +434,7 @@ def project_dialog():
     label = """<View>
       <TextEditor>
         <Text name="dialog" value="$dialog"></Text>
-        <Header name="header" value="Your answer is:"></Header>
+        <Header value="Your answer is:"></Header>
         <TextArea name="answer"></TextArea>
       </TextEditor>
     </View>"""
@@ -474,6 +533,19 @@ def setup_project_choices(client):
     return setup_project(client, project_choices)
 
 
+@pytest.fixture()
+def contextlog_test_config(settings):
+    """
+    Configure settings for contextlog tests in CI.
+    Be sure that responses is activated in any testcase where this fixture is used.
+    """
+
+    settings.COLLECT_ANALYTICS = True
+    settings.CONTEXTLOG_SYNC = True
+    settings.TEST_ENVIRONMENT = False
+    settings.DEBUG_CONTEXTLOG = False
+
+
 @pytest.fixture
 def business_client(client):
     # we work in empty database, so let's create business user and login
@@ -491,6 +563,7 @@ def business_client(client):
     client.admin = user
     client.annotator = user
     client.user = user
+    client.api_key = user.reset_token().key
     client.organization = org
 
     if signin(client, email, password).status_code != 302:
@@ -562,7 +635,7 @@ def configured_project(business_client, annotator_client):
     ]
 
     # get user to be owner
-    users = User.objects.filter(email='business@pytest.net')  # TODO: @nik: how to get proper email for business here?
+    users = User.objects.filter(email='business@pytest.net')  # TODO(nik): how to get proper email for business here?
     project = make_project(_project_for_text_choices_onto_A_B_classes, users[0])
 
     assert project.ml_backends.first().url == 'http://localhost:8999'
@@ -574,6 +647,19 @@ def configured_project(business_client, annotator_client):
 @pytest.fixture(name='django_live_url')
 def get_server_url(live_server):
     yield live_server.url
+
+
+@pytest.fixture(name='ff_front_dev_1682_model_version_dropdown_070622_short_off', autouse=True)
+def ff_front_dev_1682_model_version_dropdown_070622_short_off():
+    from core.feature_flags import flag_set
+
+    def fake_flag_set(*args, **kwargs):
+        if args[0] == 'ff_front_dev_1682_model_version_dropdown_070622_short':
+            return False
+        return flag_set(*args, **kwargs)
+
+    with mock.patch('tasks.serializers.flag_set', wraps=fake_flag_set):
+        yield
 
 
 @pytest.fixture(name='async_import_off', autouse=True)
@@ -747,3 +833,25 @@ def tick_clock(_, seconds: int = 1) -> None:
     now += timedelta(seconds=seconds)
     freezer = freeze_time(now)
     freezer.start()
+
+
+def freeze_datetime(response, utc_time: str) -> None:
+    global freezer
+    freezer.stop()
+    freezer = freeze_time(utc_time)
+    freezer.start()
+
+
+def pytest_collection_modifyitems(config, items):
+    # This function is called by pytest after the collection of tests has been completed to modify their order
+    # it is being used as a workaround for the fact the kms and aes mocks resist teardown and cause other test failures
+
+    mock_tests = []
+    other_tests = []
+    for item in items:
+        if 'mock_s3_resource_kms' in item.fixturenames or 'mock_s3_resource_aes' in item.fixturenames:
+            mock_tests.append(item)
+        else:
+            other_tests.append(item)
+
+    items[:] = other_tests + mock_tests

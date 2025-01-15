@@ -2,10 +2,36 @@
 """
 import bleach
 from constants import SAFE_HTML_ATTRIBUTES, SAFE_HTML_TAGS
+from django.db.models import Q
+from label_studio_sdk.label_interface import LabelInterface
+from label_studio_sdk.label_interface.control_tags import (
+    BrushLabelsTag,
+    BrushTag,
+    ChoicesTag,
+    DateTimeTag,
+    EllipseLabelsTag,
+    EllipseTag,
+    HyperTextLabelsTag,
+    KeyPointLabelsTag,
+    KeyPointTag,
+    LabelsTag,
+    NumberTag,
+    ParagraphLabelsTag,
+    PolygonLabelsTag,
+    PolygonTag,
+    RatingTag,
+    RectangleLabelsTag,
+    RectangleTag,
+    TaxonomyTag,
+    TextAreaTag,
+    TimeSeriesLabelsTag,
+    VideoRectangleTag,
+)
 from projects.models import Project, ProjectImport, ProjectOnboarding, ProjectReimport, ProjectSummary
 from rest_flex_fields import FlexFieldsModelSerializer
 from rest_framework import serializers
 from rest_framework.serializers import SerializerMethodField
+from tasks.models import Task
 from users.serializers import UserSimpleSerializer
 
 
@@ -55,7 +81,7 @@ class ProjectSerializer(FlexFieldsModelSerializer):
 
     created_by = UserSimpleSerializer(default=CreatedByFromContext(), help_text='Project owner')
 
-    parsed_label_config = SerializerMethodField(
+    parsed_label_config = serializers.JSONField(
         default=None, read_only=True, help_text='JSON-formatted labeling configuration'
     )
     start_training_on_annotation_update = SerializerMethodField(
@@ -64,11 +90,79 @@ class ProjectSerializer(FlexFieldsModelSerializer):
     config_has_control_tags = SerializerMethodField(
         default=None, read_only=True, help_text='Flag to detect is project ready for labeling'
     )
+    config_suitable_for_bulk_annotation = serializers.SerializerMethodField(
+        default=None, read_only=True, help_text='Flag to detect is project ready for bulk annotation'
+    )
     finished_task_number = serializers.IntegerField(default=None, read_only=True, help_text='Finished tasks')
+
+    queue_total = serializers.SerializerMethodField()
+    queue_done = serializers.SerializerMethodField()
+
+    @property
+    def user_id(self):
+        try:
+            return self.context['request'].user.id
+        except KeyError:
+            return next(iter(self.context['user_cache']))
 
     @staticmethod
     def get_config_has_control_tags(project):
         return len(project.get_parsed_config()) > 0
+
+    @staticmethod
+    def get_config_suitable_for_bulk_annotation(project):
+        li = LabelInterface(project.label_config)
+
+        # List of tags that should not be present
+        disallowed_tags = [
+            LabelsTag,
+            BrushTag,
+            BrushLabelsTag,
+            EllipseTag,
+            EllipseLabelsTag,
+            KeyPointTag,
+            KeyPointLabelsTag,
+            PolygonTag,
+            PolygonLabelsTag,
+            RectangleTag,
+            RectangleLabelsTag,
+            HyperTextLabelsTag,
+            ParagraphLabelsTag,
+            TimeSeriesLabelsTag,
+            VideoRectangleTag,
+        ]
+
+        # Return False if any disallowed tag is present
+        for tag_class in disallowed_tags:
+            if li.find_tags_by_class(tag_class):
+                return False
+
+        # Check perRegion/perItem for expanded list of tags, plus value="no" for Choices/Taxonomy
+        allowed_tags_for_checks = [ChoicesTag, TaxonomyTag, DateTimeTag, NumberTag, RatingTag, TextAreaTag]
+        for tag_class in allowed_tags_for_checks:
+            tags = li.find_tags_by_class(tag_class)
+            for tag in tags:
+                per_region = tag.attr.get('perRegion', 'false').lower() == 'true'
+                per_item = tag.attr.get('perItem', 'false').lower() == 'true'
+                if per_region or per_item:
+                    return False
+                # For ChoicesTag and TaxonomyTag, the value attribute must not be set at all
+                if tag_class in [ChoicesTag, TaxonomyTag]:
+                    if 'value' in tag.attr:
+                        return False
+
+        # For TaxonomyTag, check labeling and apiUrl
+        taxonomy_tags = li.find_tags_by_class(TaxonomyTag)
+        for tag in taxonomy_tags:
+            labeling = tag.attr.get('labeling', 'false').lower() == 'true'
+            if labeling:
+                return False
+            api_url = tag.attr.get('apiUrl', None)
+            if api_url is not None:
+                return False
+
+        # If all checks pass, return True
+        return True
 
     @staticmethod
     def get_parsed_label_config(project):
@@ -82,6 +176,7 @@ class ProjectSerializer(FlexFieldsModelSerializer):
         # FIXME: remake this logic with start_training_on_annotation_update
         initial_data = data
         data = super().to_internal_value(data)
+
         if 'start_training_on_annotation_update' in initial_data:
             data['min_annotations_to_start_training'] = int(initial_data['start_training_on_annotation_update'])
 
@@ -141,6 +236,9 @@ class ProjectSerializer(FlexFieldsModelSerializer):
             'reveal_preannotations_interactively',
             'pinned_at',
             'finished_task_number',
+            'queue_total',
+            'queue_done',
+            'config_suitable_for_bulk_annotation',
         ]
 
     def validate_label_config(self, value):
@@ -151,6 +249,68 @@ class ProjectSerializer(FlexFieldsModelSerializer):
             # Existing project is updated
             self.instance.validate_config(value)
         return value
+
+    def validate_model_version(self, value):
+        """Custom model_version validation"""
+        p = self.instance
+
+        # Only run the validation if model_version is about to change
+        # and it contains a string
+        if p is not None and p.model_version != value and value != '':
+            # that model_version should either match live ml backend
+            # or match version in predictions
+
+            if p.ml_backends.filter(title=value).union(p.predictions.filter(project=p, model_version=value)).exists():
+                return value
+            else:
+                raise serializers.ValidationError(
+                    "Model version doesn't exist either as live model or as static predictions."
+                )
+
+        return value
+
+    def update(self, instance, validated_data):
+        if validated_data.get('show_collab_predictions') is False:
+            instance.model_version = ''
+
+        return super().update(instance, validated_data)
+
+    def get_queue_total(self, project):
+        remain = project.tasks.filter(
+            Q(is_labeled=False) & ~Q(annotations__completed_by_id=self.user_id)
+            | Q(annotations__completed_by_id=self.user_id)
+        ).distinct()
+        return remain.count()
+
+    def get_queue_done(self, project):
+        tasks_filter = {
+            'project': project,
+            'annotations__completed_by_id': self.user_id,
+        }
+
+        if project.skip_queue == project.SkipQueue.REQUEUE_FOR_ME:
+            tasks_filter['annotations__was_cancelled'] = False
+
+        already_done_tasks = Task.objects.filter(**tasks_filter)
+        result = already_done_tasks.distinct().count()
+
+        return result
+
+
+class ProjectCountsSerializer(ProjectSerializer):
+    class Meta:
+        model = Project
+        fields = [
+            'id',
+            'task_number',
+            'finished_task_number',
+            'total_predictions_number',
+            'total_annotations_number',
+            'num_tasks_with_annotations',
+            'useful_annotation_number',
+            'ground_truth_number',
+            'skipped_annotations_number',
+        ]
 
 
 class ProjectOnboardingSerializer(serializers.ModelSerializer):
@@ -183,6 +343,12 @@ class ProjectReimportSerializer(serializers.ModelSerializer):
     class Meta:
         model = ProjectReimport
         fields = '__all__'
+
+
+class ProjectModelVersionExtendedSerializer(serializers.Serializer):
+    model_version = serializers.CharField()
+    count = serializers.IntegerField()
+    latest = serializers.DateTimeField()
 
 
 class GetFieldsSerializer(serializers.Serializer):
