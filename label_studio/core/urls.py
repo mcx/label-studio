@@ -1,6 +1,6 @@
 """This file and its contents are licensed under the Apache License 2.0. Please see the included NOTICE for copyright information and LICENSE for a copy of the license.
-"""
-"""bn URL Configuration
+
+URL Configurations
 
 The `urlpatterns` list routes URLs to views. For more information please see:
     https://docs.djangoproject.com/en/2.0/topics/http/urls/
@@ -25,20 +25,28 @@ from django.urls import path, re_path
 from django.views.generic.base import RedirectView
 from drf_yasg import openapi
 from drf_yasg.views import get_schema_view
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
 
 handler500 = 'core.views.custom_500'
 
 versions = collect_versions()
-schema_view = get_schema_view(
-    openapi.Info(
-        title='Label Studio API',
-        default_version='v' + versions['release'],
-        contact=openapi.Contact(url='https://labelstud.io'),
-        x_logo={'url': '../../static/icons/logo-black.svg'},
-    ),
+open_api_info = openapi.Info(
+    title='Label Studio API',
+    default_version='v' + versions['release'],
+    contact=openapi.Contact(url='https://labelstud.io'),
+    x_logo={'url': '../../static/icons/logo-black.svg'},
+)
+
+private_schema_view = get_schema_view(
+    open_api_info,
     public=True,
-    permission_classes=(IsAuthenticated,),
+    permission_classes=[IsAuthenticated],
+)
+
+public_schema_view = get_schema_view(
+    open_api_info,
+    public=True,
+    permission_classes=[AllowAny],
 )
 
 urlpatterns = [
@@ -56,7 +64,13 @@ urlpatterns = [
     ),
     re_path(r'^dm/(?P<path>.*)$', serve, kwargs={'document_root': settings.DM_ROOT, 'show_indexes': True}),
     re_path(
-        r'^react-app/(?P<path>.*)$', serve, kwargs={'document_root': settings.REACT_APP_ROOT, 'show_indexes': True}
+        r'^react-app/(?P<path>.*)$',
+        serve,
+        kwargs={
+            'document_root': settings.REACT_APP_ROOT,
+            'show_indexes': True,
+            'manifest_asset_prefix': 'react-app',
+        },
     ),
     re_path(
         r'^static/fonts/roboto/roboto.css$',
@@ -82,9 +96,11 @@ urlpatterns = [
     re_path(r'trigger500/', views.TriggerAPIError.as_view(), name='metrics'),
     re_path(r'samples/time-series.csv', views.samples_time_series, name='static_time_series'),
     re_path(r'samples/paragraphs.json', views.samples_paragraphs, name='samples_paragraphs'),
-    re_path(r'^swagger(?P<format>\.json|\.yaml)$', schema_view.without_ui(cache_timeout=0), name='schema-json'),
-    re_path(r'^swagger/$', schema_view.with_ui('swagger', cache_timeout=0), name='schema-swagger-ui'),
-    path('docs/api/', schema_view.with_ui('redoc', cache_timeout=0), name='schema-redoc'),
+    re_path(
+        r'^swagger(?P<format>\.json|\.yaml)$', private_schema_view.without_ui(cache_timeout=0), name='schema-json'
+    ),
+    re_path(r'^swagger/$', private_schema_view.with_ui('swagger', cache_timeout=0), name='schema-swagger-ui'),
+    path('docs/api/', public_schema_view.with_ui('redoc', cache_timeout=0), name='schema-redoc'),
     path(
         'docs/',
         RedirectView.as_view(url='/static/docs/public/guide/introduction.html', permanent=False),
@@ -93,6 +109,8 @@ urlpatterns = [
     path('admin/', admin.site.urls),
     path('django-rq/', include('django_rq.urls')),
     path('feature-flags/', views.feature_flags, name='feature_flags'),
+    path('heidi-tips/', views.heidi_tips, name='heidi_tips'),
+    path('__lsa/', views.collect_metrics, name='collect_metrics'),
     re_path(r'^api-auth/', include('rest_framework.urls', namespace='rest_framework')),
 ]
 

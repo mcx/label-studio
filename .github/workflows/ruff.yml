@@ -12,11 +12,16 @@ jobs:
     name: Ruff
     runs-on: ubuntu-latest
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
-      with:
-        ref: ${{ inputs.head_sha }}
-    - uses: actions/setup-python@v3
-    - uses: pre-commit/action@v3.0.0
-      with:
-        extra_args: ruff --all-files --hook-stage pre-push
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.head_sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: pre-commit/action@v3.0.1
+        with:
+          extra_args: ruff --all-files --hook-stage pre-push

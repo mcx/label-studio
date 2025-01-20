@@ -5,6 +5,7 @@ import json
 import logging
 import traceback as tb
 from datetime import datetime
+from typing import Union
 from urllib.parse import urljoin
 
 import django_rq
@@ -26,6 +27,8 @@ from io_storages.utils import get_uri_via_regex
 from rq.job import Job
 from tasks.models import Annotation, Task
 from tasks.serializers import AnnotationSerializer, PredictionSerializer
+from webhooks.models import WebhookAction
+from webhooks.utils import emit_webhooks_for_instance
 
 logger = logging.getLogger(__name__)
 
@@ -150,7 +153,7 @@ class StorageInfo(models.Model):
             self.job_health_check()
 
         # in progress last ping time, job is not needed here
-        if self.status == self.Status.IN_PROGRESS and delta > settings.STORAGE_IN_PROGRESS_TIMER * 2:
+        if self.status == self.Status.IN_PROGRESS and delta > settings.STORAGE_IN_PROGRESS_TIMER * 5:
             self.status = self.Status.FAILED
             self.traceback = (
                 'It appears the job was failed because the last ping time is too old, '
@@ -229,9 +232,13 @@ class ImportStorage(Storage):
     def generate_http_url(self, url):
         raise NotImplementedError
 
-    def can_resolve_url(self, url):
-        # TODO: later check to the full prefix like "url.startswith(self.path_full)"
-        # Search of occurrences inside string, e.g. for cases like "gs://bucket/file.pdf" or "<embed src='gs://bucket/file.pdf'/>"
+    def can_resolve_url(self, url: Union[str, None]) -> bool:
+        return self.can_resolve_scheme(url)
+
+    def can_resolve_scheme(self, url: Union[str, None]) -> bool:
+        if not url:
+            return False
+        # TODO: Search for occurrences inside string, e.g. for cases like "gs://bucket/file.pdf" or "<embed src='gs://bucket/file.pdf'/>"
         _, prefix = get_uri_via_regex(url, prefixes=(self.url_scheme,))
         if prefix == self.url_scheme:
             return True
@@ -259,15 +266,15 @@ class ImportStorage(Storage):
         elif isinstance(uri, str):
             try:
                 # extract uri first from task data
-                extracted_uri, extracted_storage = get_uri_via_regex(uri, prefixes=(self.url_scheme,))
-                if not extracted_storage:
+                extracted_uri, _ = get_uri_via_regex(uri, prefixes=(self.url_scheme,))
+                if not self.can_resolve_url(extracted_uri):
                     logger.debug(f'No storage info found for URI={uri}')
                     return
 
                 if self.presign and task is not None:
                     proxy_url = urljoin(
                         settings.HOSTNAME,
-                        reverse('data_import:storage-data-presign', kwargs={'task_id': task.id})
+                        reverse('data_import:task-storage-data-presign', kwargs={'task_id': task.id})
                         + f'?fileuri={base64.urlsafe_b64encode(extracted_uri.encode()).decode()}',
                     )
                     return uri.replace(extracted_uri, proxy_url)
@@ -337,6 +344,7 @@ class ImportStorage(Storage):
             logger.debug(f'Create {len(predictions)} predictions for task={task}')
             for prediction in predictions:
                 prediction['task'] = task.id
+                prediction['project'] = project.id
             prediction_ser = PredictionSerializer(data=predictions, many=True)
             if prediction_ser.is_valid(raise_exception=raise_exception):
                 prediction_ser.save()
@@ -345,10 +353,12 @@ class ImportStorage(Storage):
             logger.debug(f'Create {len(annotations)} annotations for task={task}')
             for annotation in annotations:
                 annotation['task'] = task.id
+                annotation['project'] = project.id
             annotation_ser = AnnotationSerializer(data=annotations, many=True)
             if annotation_ser.is_valid(raise_exception=raise_exception):
                 annotation_ser.save()
-            # FIXME: add_annotation_history / post_process_annotations should be here
+        return task
+        # FIXME: add_annotation_history / post_process_annotations should be here
 
     def _scan_and_create_links(self, link_class):
         """
@@ -363,6 +373,7 @@ class ImportStorage(Storage):
         task = self.project.tasks.order_by('-inner_id').first()
         max_inner_id = (task.inner_id + 1) if task else 1
 
+        tasks_for_webhook = []
         for key in self.iterkeys():
             # w/o Dataflow
             # pubsub.push(topic, key)
@@ -387,11 +398,30 @@ class ImportStorage(Storage):
                     f'"Treat every bucket object as a source file"'
                 )
 
-            self.add_task(data, self.project, maximum_annotations, max_inner_id, self, key, link_class)
+            task = self.add_task(data, self.project, maximum_annotations, max_inner_id, self, key, link_class)
             max_inner_id += 1
 
             # update progress counters for storage info
             tasks_created += 1
+
+            # add task to webhook list
+            tasks_for_webhook.append(task)
+
+            # settings.WEBHOOK_BATCH_SIZE
+            # `WEBHOOK_BATCH_SIZE` sets the maximum number of tasks sent in a single webhook call, ensuring manageable payload sizes.
+            # When `tasks_for_webhook` accumulates tasks equal to/exceeding `WEBHOOK_BATCH_SIZE`, they're sent in a webhook via
+            # `emit_webhooks_for_instance`, and `tasks_for_webhook` is cleared for new tasks.
+            # If tasks remain in `tasks_for_webhook` at process end (less than `WEBHOOK_BATCH_SIZE`), they're sent in a final webhook
+            # call to ensure all tasks are processed and no task is left unreported in the webhook.
+            if len(tasks_for_webhook) >= settings.WEBHOOK_BATCH_SIZE:
+                emit_webhooks_for_instance(
+                    self.project.organization, self.project, WebhookAction.TASKS_CREATED, tasks_for_webhook
+                )
+                tasks_for_webhook = []
+        if tasks_for_webhook:
+            emit_webhooks_for_instance(
+                self.project.organization, self.project, WebhookAction.TASKS_CREATED, tasks_for_webhook
+            )
 
         self.project.update_tasks_states(
             maximum_annotations_changed=False, overlap_cohort_percentage_changed=False, tasks_number_changed=True
@@ -420,6 +450,7 @@ class ImportStorage(Storage):
                     project_id=self.project.id,
                     organization_id=self.project.organization.id,
                     on_failure=storage_background_failure,
+                    job_timeout=settings.RQ_LONG_JOB_TIMEOUT,
                 )
                 self.info_set_job(sync_job.id)
                 logger.info(f'Storage sync background job {sync_job.id} for storage {self} has been started')
@@ -495,11 +526,17 @@ class ExportStorage(Storage, ProjectStorageMixin):
     )
 
     def _get_serialized_data(self, annotation):
-        if settings.FUTURE_SAVE_TASK_TO_STORAGE:
+        user = self.project.organization.created_by
+        flag = flag_set(
+            'fflag_feat_optic_650_target_storage_task_format_long', user=user, override_system_default=False
+        )
+        if settings.FUTURE_SAVE_TASK_TO_STORAGE or flag:
             # export task with annotations
             # TODO: we have to rewrite save_all_annotations, because this func will be called for each annotation
             # TODO: instead of each task, however, we have to call it only once per task
-            return ExportDataSerializer(annotation.task).data
+            expand = ['annotations.reviews', 'annotations.completed_by']
+            context = {'project': self.project}
+            return ExportDataSerializer(annotation.task, context=context, expand=expand).data
         else:
             serializer_class = load_func(settings.STORAGE_ANNOTATION_SERIALIZER)
             # deprecated functionality - save only annotation
@@ -512,8 +549,12 @@ class ExportStorage(Storage, ProjectStorageMixin):
         annotation_exported = 0
         total_annotations = Annotation.objects.filter(project=self.project).count()
         self.info_set_in_progress()
+        self.cached_user = self.project.organization.created_by
 
-        for annotation in Annotation.objects.filter(project=self.project):
+        for annotation in Annotation.objects.filter(project=self.project).iterator(
+            chunk_size=settings.STORAGE_EXPORT_CHUNK_SIZE
+        ):
+            annotation.cached_user = self.cached_user
             self.save_annotation(annotation)
 
             # update progress counters
@@ -573,7 +614,7 @@ class ImportStorageLink(models.Model):
 
 class ExportStorageLink(models.Model):
 
-    annotation = models.OneToOneField(
+    annotation = models.ForeignKey(
         'tasks.Annotation', on_delete=models.CASCADE, related_name='%(app_label)s_%(class)s'
     )
     object_exists = models.BooleanField(
@@ -584,9 +625,18 @@ class ExportStorageLink(models.Model):
 
     @staticmethod
     def get_key(annotation):
-        if settings.FUTURE_SAVE_TASK_TO_STORAGE:
-            return str(annotation.task.id) + '.json' if settings.FUTURE_SAVE_TASK_TO_STORAGE_JSON_EXT else ''
-        return str(annotation.id)
+        # get user who created the organization explicitly using filter/values_list to avoid prefetching
+        user = getattr(annotation, 'cached_user', None)
+        # when signal for annotation save is called, user is not cached
+        if user is None:
+            user = annotation.project.organization.created_by
+        flag = flag_set('fflag_feat_optic_650_target_storage_task_format_long', user=user)
+
+        if settings.FUTURE_SAVE_TASK_TO_STORAGE or flag:
+            ext = '.json' if settings.FUTURE_SAVE_TASK_TO_STORAGE_JSON_EXT or flag else ''
+            return str(annotation.task.id) + ext
+        else:
+            return str(annotation.id)
 
     @property
     def key(self):

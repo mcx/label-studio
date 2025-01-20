@@ -1,7 +1,11 @@
-from typing import Mapping, Optional
+from typing import TYPE_CHECKING, Mapping, Optional
 
 from core.redis import start_job_async_or_sync
+from django.db.models import QuerySet
 from django.utils.functional import cached_property
+
+if TYPE_CHECKING:
+    from users.models import User
 
 
 class ProjectMixin:
@@ -10,14 +14,6 @@ class ProjectMixin:
         Async start rearrange overlap depending on annotation count in tasks
         """
         start_job_async_or_sync(self._rearrange_overlap_cohort)
-
-    def update_tasks_counters(self, tasks_queryset, from_scratch=True):
-        """
-        Async start updating tasks counters
-        :param tasks_queryset: Tasks to update queryset
-        :param from_scratch: Skip calculated tasks
-        """
-        start_job_async_or_sync(self._update_tasks_counters, tasks_queryset, from_scratch=from_scratch)
 
     def update_tasks_counters_and_is_labeled(self, tasks_queryset, from_scratch=True):
         """
@@ -93,9 +89,11 @@ class ProjectMixin:
         return True
 
     @cached_property
-    def all_members(self):
+    def all_members(self) -> QuerySet['User']:
         """
-        Returns all members of project
-        :return:
+        Returns all users of project
+        :return: QuerySet[User]
         """
-        return self.organization.members.values_list('user__id', flat=True)
+        from users.models import User
+
+        return User.objects.filter(id__in=self.organization.members.values_list('user__id'))

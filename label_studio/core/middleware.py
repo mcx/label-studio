@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import ujson as json
 from core.utils.contextlog import ContextLog
+from csp.middleware import CSPMiddleware
 from django.conf import settings
 from django.contrib.auth import logout
 from django.core.exceptions import MiddlewareNotUsed
@@ -96,6 +97,14 @@ class CommonMiddlewareAppendSlashWithoutRedirect(CommonMiddleware):
 
         return response
 
+    def should_redirect_with_slash(self, request):
+        """
+        Override the original method to keep global APPEND_SLASH setting false
+        """
+        if not request.path_info.endswith('/'):
+            return True
+        return False
+
 
 class SetSessionUIDMiddleware(CommonMiddleware):
     def process_request(self, request):
@@ -158,6 +167,21 @@ class DatabaseIsLockedRetryMiddleware(CommonMiddleware):
         return response
 
 
+class XApiKeySupportMiddleware:
+    """Middleware that adds support for the X-Api-Key header, by having its value supersede
+    anything that's set in the Authorization header."""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        if 'HTTP_X_API_KEY' in request.META:
+            request.META['HTTP_AUTHORIZATION'] = f'Token {request.META["HTTP_X_API_KEY"]}'
+            del request.META['HTTP_X_API_KEY']
+
+        return self.get_response(request)
+
+
 class UpdateLastActivityMiddleware(CommonMiddleware):
     def process_view(self, request, view_func, view_args, view_kwargs):
         if hasattr(request, 'user') and request.method not in SAFE_METHODS:
@@ -207,3 +231,20 @@ class InactivitySessionTimeoutMiddleWare(CommonMiddleware):
         request.session.set_expiry(
             settings.MAX_TIME_BETWEEN_ACTIVITY if request.session.get('keep_me_logged_in', True) else 0
         )
+
+
+class HumanSignalCspMiddleware(CSPMiddleware):
+    """
+    Extend CSPMiddleware to support switching report-only CSP to regular CSP.
+
+    For use with core.decorators.override_report_only_csp.
+    """
+
+    def process_response(self, request, response):
+        response = super().process_response(request, response)
+        if getattr(response, '_override_report_only_csp', False):
+            if csp_policy := response.get('Content-Security-Policy-Report-Only'):
+                response['Content-Security-Policy'] = csp_policy
+                del response['Content-Security-Policy-Report-Only']
+            delattr(response, '_override_report_only_csp')
+        return response

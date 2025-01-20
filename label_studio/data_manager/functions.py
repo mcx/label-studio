@@ -2,6 +2,7 @@
 """
 import logging
 from collections import OrderedDict
+from typing import Any, Iterable, Tuple
 from urllib.parse import unquote
 
 import ujson as json
@@ -89,18 +90,17 @@ def get_all_columns(project, *_):
         }
     ]
 
-    if flag_set('ff_back_2070_inner_id_12052022_short', user=project.organization.created_by):
-        result['columns'] += [
-            {
-                'id': 'inner_id',
-                'title': 'Inner ID',
-                'type': 'Number',
-                'help': 'Internal task ID starting from 1 for the current project',
-                'target': 'tasks',
-                'visibility_defaults': {'explore': False, 'labeling': False},
-                'project_defined': False,
-            }
-        ]
+    result['columns'] += [
+        {
+            'id': 'inner_id',
+            'title': 'Inner ID',
+            'type': 'Number',
+            'help': 'Internal task ID starting from 1 for the current project',
+            'target': 'tasks',
+            'visibility_defaults': {'explore': False, 'labeling': False},
+            'project_defined': False,
+        }
+    ]
 
     if flag_set('fflag_fix_back_lsdv_4648_annotator_filter_29052023_short', user=project.organization.created_by):
         project_members = project.all_members.values_list('id', flat=True)
@@ -296,9 +296,23 @@ def get_prepare_params(request, project):
 
         selected = data.get('selectedItems', {'all': True, 'excluded': []})
         if not isinstance(selected, dict):
-            raise DataManagerException(
-                'selectedItems must be dict: {"all": [true|false], ' '"excluded | included": [...task_ids...]}'
-            )
+            if isinstance(selected, str):
+                # try to parse JSON string
+                try:
+                    selected = json.loads(selected)
+                except Exception as e:
+                    logger.error(f'Error parsing selectedItems: {e}')
+                    raise DataManagerException(
+                        'selectedItems must be JSON encoded string for dict: {"all": [true|false], '
+                        '"excluded | included": [...task_ids...]}. '
+                        f'Found: {selected}'
+                    )
+            else:
+                raise DataManagerException(
+                    'selectedItems must be dict: {"all": [true|false], '
+                    '"excluded | included": [...task_ids...]}. '
+                    f'Found type: {type(selected)} with value: {selected}'
+                )
         filters = data.get('filters', None)
         ordering = data.get('ordering', [])
         prepare_params = PrepareParams(
@@ -314,15 +328,20 @@ def get_prepared_queryset(request, project):
 
 
 def evaluate_predictions(tasks):
-    """Call ML backend for prediction evaluation of the task queryset"""
+    """
+    Call the given ML backend to retrieve predictions with the task queryset as an input.
+    If backend is not specified, we'll assume the tasks' project only has one associated
+    ML backend, and use that backend.
+    """
     if not tasks:
         return
 
     project = tasks[0].project
 
-    for ml_backend in project.ml_backends.all():
-        # tasks = tasks.filter(~Q(predictions__model_version=ml_backend.model_version))
-        ml_backend.predict_tasks(tasks)
+    backend = project.ml_backend
+
+    if backend:
+        return backend.predict_tasks(tasks=tasks)
 
 
 def filters_ordering_selected_items_exist(data):
@@ -337,14 +356,75 @@ def preprocess_filter(_filter, *_):
     return _filter
 
 
-def preprocess_field_name(raw_field_name, only_undefined_field=False):
-    field_name = raw_field_name.replace('filter:', '')
-    field_name = field_name.replace('tasks:', '')
-    ascending = False if field_name[0] == '-' else True  # detect direction
-    field_name = field_name[1:] if field_name[0] == '-' else field_name  # remove direction
+def preprocess_field_name(raw_field_name, project) -> Tuple[str, bool]:
+    """Transform a field name (as specified in the datamanager views endpoint) to
+    a django ORM field name. Also handle dotted accesses to task.data.
+
+    Edit with care; it's critical that this function not be changed in ways that
+    introduce vulnerabilities in the vein of the ORM Leak (see #5012). In particular
+    it is not advisable to use `replace` or other calls that replace all instances
+    of a string within this function.
+
+    Returns: Django ORM field name: str, Sort is ascending: bool
+    """
+
+    field_name = raw_field_name
+    ascending = True
+
+    # Descending marker `-` may come at the beginning of the string
+    if field_name.startswith('-'):
+        ascending = False
+        field_name = field_name[1:]
+
+    # For security reasons, these must only be removed when they fall at the beginning of the string (or after `-`).
+    optional_prefixes = ['filter:', 'tasks:']
+    for prefix in optional_prefixes:
+        if field_name.startswith(prefix):
+            field_name = field_name[len(prefix) :]
+
+    # Descending marker may also come after other prefixes. Double negative is not allowed.
+    if ascending and field_name.startswith('-'):
+        ascending = False
+        field_name = field_name[1:]
+
     if field_name.startswith('data.'):
-        if only_undefined_field:
+        # process as $undefined$ only if real_name is from labeling config, not from task.data
+        real_name = field_name.replace('data.', '')
+        common_data_columns = project.summary.common_data_columns
+        real_name_suitable = (
+            # there is only one object tag in labeling config
+            # and requested filter name == value from object tag
+            len(project.data_types.keys()) == 1
+            and real_name in project.data_types.keys()
+            # file was uploaded before labeling config is set, `data.data` is system predefined name
+            or len(project.data_types.keys()) == 0
+            and real_name == 'data'
+        )
+        if (
+            real_name_suitable
+            # common data columns are not None
+            and common_data_columns
+            # $undefined$ is in common data columns, in all tasks
+            and settings.DATA_UNDEFINED_NAME in common_data_columns
+        ):
             field_name = f'data__{settings.DATA_UNDEFINED_NAME}'
         else:
             field_name = field_name.replace('data.', 'data__')
     return field_name, ascending
+
+
+def intersperse(items: Iterable, separator: Any) -> list:
+    """
+    Create a list with a separator between each item in the passed iterable `items`
+
+    for example, intersperse(['one', 'two', 'three'], 0) == ['one', 0, 'two', 0, 'three']
+    """
+
+    output = []
+    for item in items:
+        output.append(item)
+        output.append(separator)
+    # if there are no items, there will be no last separator to remove
+    if output:
+        output.pop()
+    return output

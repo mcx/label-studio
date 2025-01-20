@@ -1,15 +1,18 @@
 import base64
+import fnmatch
 import json
 import logging
 import re
 from datetime import timedelta
 from enum import Enum
+from functools import lru_cache
 from json import JSONDecodeError
-from typing import Union
+from typing import Optional, Union
 from urllib.parse import urlparse
 
 import google.auth
 import google.cloud.storage as gcs
+from core.utils.common import get_ttl_hash
 from django.conf import settings
 from google.auth.exceptions import DefaultCredentialsError
 from google.oauth2 import service_account
@@ -29,6 +32,22 @@ class GCS(object):
         JSON = 2
         JSON_DICT = 3
         BASE64 = 4
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def get_bucket(
+        cls,
+        ttl_hash: int,
+        google_project_id: Optional[str] = None,
+        google_application_credentials: Optional[Union[str, dict]] = None,
+        bucket_name: Optional[str] = None,
+    ) -> gcs.Bucket:
+
+        client = cls.get_client(
+            google_project_id=google_project_id, google_application_credentials=google_application_credentials
+        )
+
+        return client.get_bucket(bucket_name)
 
     @classmethod
     def get_client(
@@ -157,6 +176,7 @@ class GCS(object):
     def generate_http_url(
         cls,
         url: str,
+        presign: bool,
         google_application_credentials: Union[str, dict] = None,
         google_project_id: str = None,
         presign_ttl: int = 1,
@@ -164,6 +184,7 @@ class GCS(object):
         """
         Gets gs:// like URI string and returns presigned https:// URL
         :param url: input URI
+        :param presign: Whether to generate presigned URL. If false, will generate base64 encoded data URL
         :param google_application_credentials:
         :param google_project_id:
         :param presign_ttl: Presign TTL in minutes
@@ -179,19 +200,29 @@ class GCS(object):
         this if you are using Application Default Credentials from Google Compute
         Engine or from the Google Cloud SDK.
         """
-        client = cls.get_client(
-            google_application_credentials=google_application_credentials, google_project_id=google_project_id
+        bucket = cls.get_bucket(
+            ttl_hash=get_ttl_hash(),
+            google_application_credentials=google_application_credentials,
+            google_project_id=google_project_id,
+            bucket_name=bucket_name,
         )
-        bucket = client.get_bucket(bucket_name)
+
         blob = bucket.blob(blob_name)
 
         # this flag should be OFF, maybe we need to enable it for 1-2 customers, we have to check it
         if settings.GCS_CLOUD_STORAGE_FORCE_DEFAULT_CREDENTIALS:
             # google_application_credentials has higher priority,
             # use Application Default Credentials (ADC) when google_application_credentials is empty only
-            kwargs = {} if google_application_credentials else cls._get_default_credentials()
+            maybe_credentials = {} if google_application_credentials else cls._get_default_credentials()
+            maybe_client = None if google_application_credentials else cls.get_client()
         else:
-            kwargs = {}
+            maybe_credentials = {}
+            maybe_client = None
+
+        if not presign:
+            blob.reload(client=maybe_client)  # needed to know the content type
+            blob_bytes = blob.download_as_bytes(client=maybe_client)
+            return f'data:{blob.content_type};base64,{base64.b64encode(blob_bytes).decode("utf-8")}'
 
         url = blob.generate_signed_url(
             version='v4',
@@ -199,7 +230,7 @@ class GCS(object):
             expiration=timedelta(minutes=presign_ttl),
             # Allow GET requests using this URL.
             method='GET',
-            **kwargs,
+            **maybe_credentials,
         )
 
         logger.debug('Generated GCS signed url: ' + url)
@@ -283,3 +314,31 @@ class GCS(object):
         if not properties_name:
             return blob._properties
         return {key: value for key, value in blob._properties.items() if key in properties_name}
+
+    @classmethod
+    def validate_pattern(cls, storage, pattern, glob_pattern=True):
+        """
+        Validate pattern against Google Cloud Storage
+        :param storage: Google Cloud Storage instance
+        :param pattern: Pattern to validate
+        :param glob_pattern: If True, pattern is a glob pattern, otherwise it is a regex pattern
+        :return: Message if pattern is not valid, empty string otherwise
+        """
+        client = storage.get_client()
+        blob_iter = client.list_blobs(
+            storage.bucket, prefix=storage.prefix, page_size=settings.CLOUD_STORAGE_CHECK_FOR_RECORDS_PAGE_SIZE
+        )
+        prefix = str(storage.prefix) if storage.prefix else ''
+        # compile pattern to regex
+        if glob_pattern:
+            pattern = fnmatch.translate(pattern)
+        regex = re.compile(str(pattern))
+        for index, blob in enumerate(blob_iter):
+            # skip directories
+            if blob.name == (prefix.rstrip('/') + '/'):
+                continue
+            # check regex pattern filter
+            if pattern and regex.match(blob.name):
+                logger.debug(blob.name + ' matches file pattern')
+                return ''
+        return 'No objects found matching the provided glob pattern'
